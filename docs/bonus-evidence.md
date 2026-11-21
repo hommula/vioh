@@ -1,5 +1,7 @@
 # Evidence for the two bonuses
 
+The same content as one page to show on screen: `docs/bonus-evidence.html` (built by `tools/evidence_page.py`).
+
 Written 21 Nov. Each line says whether it was measured on our aircraft, measured on the organizers'
 recording of this aircraft, or only simulated.
 
@@ -39,6 +41,23 @@ How the delay is measured (`src/calib.cpp`): the picture motion between two fram
 compared with the rotation the gyro saw in the same time, for every delay from -80 to +80 ms in 1 ms
 steps. The delay with the smallest leftover is the camera delay. Doing the same for three horizontal
 bands of the picture gives one delay per band; their spread from top to bottom is the readout time.
+
+### What a timestamp error costs (simulation)
+
+`simtest config.example out.csv <error in seconds>` runs the simulator with the camera timestamp wrong
+by that amount (1 m height, tilting 5 degrees every 1.3 s).
+
+| Timestamp error | Worst position error at 1 m |
+|---|---|
+| 0 ms | 3.1 cm |
+| 14 ms (the measured delay, if ignored) | 3.4 cm |
+| 30 ms | 3.8 cm |
+| 60 ms | 5.6 cm |
+
+The extra error is a tilt error, so it grows with height: 60 ms costs about 2.5 cm per metre of height.
+
+On the organizers' recording itself the tracker scores the same with and without the correction
+(80.7 % of frames registered, 160 agreeing points): that recording has no fast tilts.
 
 ### Honest limits
 

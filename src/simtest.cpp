@@ -60,7 +60,7 @@ static cv::Mat render(const cv::Mat& floor, double px_per_m, const std::vector<c
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc != 3 && argc != 4) {
         std::cerr << "usage: simtest config.txt out.csv\n";
         return 2;
     }
@@ -72,7 +72,8 @@ int main(int argc, char** argv) {
     config.values["tilt_to_px_xy"] = M(0, 1);
     config.values["tilt_to_px_yx"] = M(1, 0);
     config.values["tilt_to_px_yy"] = M(1, 1);
-    config.values["cam_delay_s"] = 0;
+    // Optional third argument: a camera timestamp error in seconds, to show what ignoring it costs.
+    config.values["cam_delay_s"] = argc > 3 ? std::stod(argv[3]) : 0;
     config.values["rolling_shutter_readout_s"] = 0;
     config.values["lens_fx"] = kLensK(0, 0);
     config.values["lens_fy"] = kLensK(1, 1);
