@@ -67,8 +67,10 @@ int main(int argc, char** argv) {
     s = controller.holdHeight(100, 0, 1500, 0.02);
     CHECK(s.throttle == config("throttle_max_us") && s.roll == 1500 && s.pitch == 1500);
 
-    // Unmeasured axis signs (all zero, as shipped) must leave roll and pitch centred.
-    hold::Controller unset(base);
+    // Unmeasured axis signs (all zero) must leave roll and pitch centred.
+    hold::Config no_axes = base;
+    for (const char* name : {"forward_from_x", "forward_from_y", "right_from_x", "right_from_y"}) no_axes.values[name] = 0;
+    hold::Controller unset(no_axes);
     s = unset.hold({5, -5}, {1, 1}, 0, 0, 1500, 0.02);
     CHECK(s.roll == 1500 && s.pitch == 1500);
 

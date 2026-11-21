@@ -22,11 +22,26 @@ import time
 import tkinter
 
 BOARD = "root@192.168.75.1"
-APB_COMMAND = ["ssh", BOARD,
+# ServerAlive: notice within about 4 s that the board lost power, so the dashboard can connect again.
+APB_COMMAND = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=2",
+               "-o", "ServerAliveCountMax=2", BOARD,
                "while :; do cat /dev/shm/nadirhold_status.txt /dev/shm/nadirhold_preview.pgm 2>/dev/null; sleep 0.1; done"]
 # BatchMode and ConnectTimeout: never wait for a password or for a board that is not there.
 ZERO_COMMAND = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", BOARD, "touch /dev/shm/nadirhold_zero"]
 ZERO_TIMEOUT_S = 8
+# Pretend engage switch, for rehearsing bench items C and D without the radio. vioh has a hand-started
+# "rehearse" mode in which a file on the board is the switch (file there = off). The first press moves
+# the board into that mode with the switch off; every later press flips the switch. The flight
+# controller ignores the commands the whole time, because its real switch is off.
+SWITCH_COMMAND = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", BOARD,
+                  "OFF=/dev/shm/nadirhold_switch_off; "
+                  "if grep -q rehearse=1 /dev/shm/nadirhold_status.txt 2>/dev/null; then "
+                  "if [ -e $OFF ]; then rm -f $OFF; else touch $OFF; fi; "
+                  "else systemctl stop nadirhold; pkill -x vioh; sleep 0.5; touch $OFF; cd /data/nadirhold; "
+                  "(./vioh config.txt logs rehearse > /dev/null 2>&1 < /dev/null &); fi"]
+# Back to the normal program (the one the judge sees): real switch only.
+NORMAL_COMMAND = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", BOARD,
+                  "pkill -x vioh; rm -f /dev/shm/nadirhold_switch_off; sleep 0.5; systemctl start nadirhold"]
 
 ZOOM = 2              # the picture is 480 x 270; show it twice as large
 STALE_AFTER_S = 2     # say so if nothing arrived for this long
@@ -76,7 +91,7 @@ FONT = "Segoe UI"
 MONO = "Consolas"     # same width for every character, so columns of numbers do not jump about
 
 # The fields that are drawn over time. Each status line is kept as numbers for these names only.
-PLOTTED_FIELDS = ["x", "y", "z", "roll", "pitch", "thr", "points", "ready", "gx", "gy", "gz"]
+PLOTTED_FIELDS = ["x", "y", "z", "zcam", "roll", "pitch", "thr", "points", "ready", "gx", "gy", "gz"]
 
 # The status table: (text on the left, fields shown on the right, how to show them).
 CAMERA_ROWS = [
@@ -146,6 +161,50 @@ def read_stream(stream):
             return                                   # the source ended in the middle of a picture
         picture_count += 1
         latest_picture = (b"P5\n%d %d\n255\n" % (width, height) + pixels, picture_count, time.monotonic())
+
+
+# vioh writes its own log on the board 50 times a second, cable or no cable. Every 5th line of the last
+# 3000 is the last minute at 10 values a second.
+LOG_COMMAND = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", BOARD,
+               "tail -n 3000 $(ls -t /data/nadirhold/logs/*.csv | head -1) | awk 'NR % 5 == 0'"]
+FORGET_HISTORY = "forget-history"     # a marker in new_status_lines: what follows replaces the graphs
+
+
+def fetch_logged_minute():
+    """Put the last minute of the board's own log into the graphs and the path plot.
+
+    This is how the dashboard shows what the aircraft estimated while the cable was unplugged: the
+    board kept logging, and on connecting again the laptop reads that log.
+    """
+    result = subprocess.run(LOG_COMMAND, capture_output=True, text=True, timeout=10)
+    rows = [line.split(",") for line in result.stdout.splitlines()]
+    rows = [row for row in rows if len(row) >= 12 and row[0][:1].isdigit()]
+    if result.returncode != 0 or not rows:
+        return                               # board not there yet, or no log: the live data still comes
+    now = time.monotonic()
+    newest = float(rows[-1][0])
+    new_status_lines.append((now, FORGET_HISTORY))
+    for row in rows:
+        text = (f"engaged={row[1]} ready={row[2]} tracking={row[3]} points={row[4]} roll={row[5]} pitch={row[6]} "
+                f"thr={row[7]} yaw={row[8]} x={row[9]} y={row[10]} z={row[11]}")
+        new_status_lines.append((now - (newest - float(row[0])), text))
+
+
+def run_source(command, reconnect, holder):
+    """Start the source command and read it. With reconnect (the board): start it again whenever it ends,
+    so the dashboard comes back by itself after the board is power-cycled (bench item E2)."""
+    while True:
+        if reconnect:
+            try:
+                fetch_logged_minute()
+            except subprocess.TimeoutExpired:
+                pass                         # the board is not answering yet: try again on the next round
+        holder["process"] = subprocess.Popen(command, stdout=subprocess.PIPE)
+        read_stream(holder["process"].stdout)
+        holder["process"].wait()
+        if not reconnect:
+            return
+        time.sleep(1)
 
 
 def send_zero_request():
@@ -344,8 +403,8 @@ def draw_graphs(canvas, fields, history, now):
                [("x", "x", BLUE, "{:+.3f}"), ("y", "y", ORANGE, "{:+.3f}")],
                fields, samples, now, must_show=(-0.5, 0.5), centre=0.0)
     # Bench item B3: a raise of 0.5 m must read between 0.35 and 0.65 m.
-    draw_strip(canvas, 100, 120, "height change z (m)",
-               [("z", "z", AQUA, "{:+.3f}")],
+    draw_strip(canvas, 100, 120, "height change (m): camera, and barometer for comparison",
+               [("camera", "zcam", AQUA, "{:+.3f}"), ("baro", "z", ORANGE, "{:+.3f}")],
                fields, samples, now, must_show=(-0.2, 0.8),
                references=[(0.5, "0.50"), (0.35, "0.35"), (0.65, "0.65")])
     # Throttle sits far from 1500, so it gets its own small graph: on one axis with roll and pitch
@@ -373,6 +432,16 @@ def draw_path(canvas, history, now):
     radius_pixels = PATH_SIZE / 2 - 28
 
     samples = [sample for sample in history if sample[0] >= trail_start_time and now - sample[0] <= TRAIL_S]
+    # A jump of more than 0.2 m between two samples (0.1 s apart) is not a carried aircraft: it is a zero,
+    # a restart of vioh, or the estimate starting again. Old points before the last jump would only
+    # stretch the plot (after resting on the floor they can be metres away), so the trail starts there.
+    for index in range(len(samples) - 1, 0, -1):
+        before, after = samples[index - 1][1], samples[index][1]
+        if None in (before["x"], before["y"], after["x"], after["y"]):
+            continue
+        if math.hypot(after["x"] - before["x"], after["y"] - before["y"]) > 0.2:
+            samples = samples[index:]
+            break
     runs = unbroken_runs(samples, ["x", "y"])
 
     # Zoom out in steps of 0.5 m if the trail leaves the plot.
@@ -452,8 +521,8 @@ def main():
     command = arguments or APB_COMMAND
     zero_reaches_board = not arguments      # with a test source there is no board to send the request to
 
-    source = subprocess.Popen(command, stdout=subprocess.PIPE)
-    threading.Thread(target=read_stream, args=(source.stdout,), daemon=True).start()
+    source = {"process": None}
+    threading.Thread(target=run_source, args=(command, not arguments, source), daemon=True).start()
 
     window = tkinter.Tk()
     window.title("vioh bench dashboard: waiting for the first data")
@@ -467,7 +536,7 @@ def main():
     banner.place(x=MARGIN, y=MARGIN, width=PICTURE_W, height=BANNER_H)
     ready_label = tkinter.Label(banner, text="WAITING", font=(FONT, -44, "bold"), bg=NEUTRAL, fg=INK)
     ready_label.place(x=0, y=0, width=290, height=BANNER_H)
-    engaged_label = tkinter.Label(banner, text="--", font=(FONT, -30, "bold"), bg=NEUTRAL, fg=INK)
+    engaged_label = tkinter.Label(banner, text="--", font=(FONT, -22, "bold"), bg=NEUTRAL, fg=INK, wraplength=165, anchor="n", pady=14)
     engaged_label.place(x=298, y=0, width=170, height=BANNER_H)
     changed_label = tkinter.Label(banner, text="", font=(FONT, -17), bg=PAGE, fg=INK, anchor="w")
     changed_label.place(x=480, y=1, width=480, height=27)
@@ -507,7 +576,7 @@ def main():
     distance_label = tkinter.Label(numbers, text="-- m", font=(FONT, -80, "bold"), bg=PAGE, fg=INK, anchor="w")
     distance_label.place(x=0, y=20, width=NUMBERS_W, height=92)
     big_labels = {}
-    for index, (field, text) in enumerate([("x", "x"), ("y", "y"), ("z", "height change z")]):
+    for index, (field, text) in enumerate([("x", "x"), ("y", "y"), ("zcam", "height change (camera)")]):
         y = 116 + index * 50
         tkinter.Label(numbers, text=text, font=(FONT, -17), bg=PAGE, fg=INK_2, anchor="w").place(
             x=0, y=y, width=130, height=50)
@@ -528,6 +597,21 @@ def main():
     zero_label = tkinter.Label(numbers, text="", font=(FONT, -13), bg=PAGE, fg=INK_2, anchor="w", justify="left",
                                wraplength=NUMBERS_W - 136)
     zero_label.place(x=128, y=268, width=NUMBERS_W - 128, height=68)
+    def run_on_board(command):
+        # In a thread, so a slow or missing board never freezes the window. The result shows in the
+        # ENGAGED box and the "rehearse" line as soon as vioh reports it.
+        threading.Thread(target=subprocess.run, args=(command,), kwargs={"timeout": 15}, daemon=True).start()
+
+    switch_button = tkinter.Button(banner, text="pretend switch (e)", font=(FONT, -12, "bold"),
+                                   command=lambda: run_on_board(SWITCH_COMMAND))
+    switch_button.place(x=298, y=BANNER_H - 26, width=110, height=26)
+    normal_button = tkinter.Button(banner, text="normal (n)", font=(FONT, -12),
+                                   command=lambda: run_on_board(NORMAL_COMMAND))
+    normal_button.place(x=408, y=BANNER_H - 26, width=60, height=26)
+    for key in ("e", "E"):
+        window.bind(f"<Key-{key}>", lambda event: run_on_board(SWITCH_COMMAND))
+    for key in ("n", "N"):
+        window.bind(f"<Key-{key}>", lambda event: run_on_board(NORMAL_COMMAND))
     window.bind("<Key-z>", lambda event: request_zero())
     window.bind("<Key-Z>", lambda event: request_zero())     # the same key with caps lock on
 
@@ -556,6 +640,9 @@ def main():
         got_any = False
         while new_status_lines:
             arrival_time, text = new_status_lines.popleft()
+            if text == FORGET_HISTORY:
+                history.clear()
+                continue
             got_any = True
             fields = parse_status_line(text)
             state["fields"] = fields
@@ -578,7 +665,7 @@ def main():
             changed_label.configure(text="waiting for the first status line...")
         elif stale:
             silent_for = now - state["status_time"]
-            if source.poll() is not None:
+            if source["process"] is not None and source["process"].poll() is not None:
                 set_ready_label("SOURCE ENDED", 32, DARK, WARNING)
                 changed_label.configure(text=f"no status line for {silent_for:.0f} s: the source command ended")
             else:
@@ -603,9 +690,9 @@ def main():
         if stale or "engaged" not in fields:
             engaged_label.configure(text="--", bg=NEUTRAL, fg=INK)
         elif fields["engaged"] == "1":
-            engaged_label.configure(text="ENGAGED", bg=WARNING, fg=INK)
+            engaged_label.configure(text="ENGAGED" + (" (pretend)" if fields.get("rehearse") == "1" else ""), bg=WARNING, fg=INK)
         elif fields["engaged"] == "0":
-            engaged_label.configure(text="pilot", bg=NEUTRAL, fg=INK)
+            engaged_label.configure(text="pilot" + (" (pretend)" if fields.get("rehearse") == "1" else ""), bg=NEUTRAL, fg=INK)
         else:
             engaged_label.configure(text=fields["engaged"], bg=NEUTRAL, fg=INK)
 
@@ -715,7 +802,7 @@ def main():
                 window.title("vioh bench dashboard: waiting for the first data")
             elif not stale:
                 window.title("vioh bench dashboard: live")
-            elif source.poll() is not None:
+            elif source["process"] is not None and source["process"].poll() is not None:
                 window.title("vioh bench dashboard: SOURCE ENDED")
             else:
                 window.title("vioh bench dashboard: NO DATA (is vioh running?)")
@@ -725,7 +812,8 @@ def main():
         window.after(int(quit_after_s * 1000), window.destroy)
     refresh()
     window.mainloop()
-    source.kill()
+    if source["process"] is not None:
+        source["process"].kill()
 
 
 if __name__ == "__main__":

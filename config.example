@@ -77,11 +77,11 @@ pilot_throttle_filter_s 0.5
 
 # --- MEASURE on the bench, props off (README, "Find the axis signs") --------------------------------
 # Which IMU axis points forward and which points right. One of each pair is +1 or -1, the other 0.
-# All zero = roll and pitch stay at 1500, which is the safe state until this is measured.
-forward_from_x 0
+# All zero = roll and pitch stay at 1500. MEASURED 21 Nov with tools/watch_move.py: a forward carry read +x (6 deg off), a right carry +y (4 deg off).
+forward_from_x 1
 forward_from_y 0
 right_from_x 0
-right_from_y 0
+right_from_y 1
 
 # --- Controller gains: STARTING VALUES FROM PHYSICS, NOT TUNED. Tune on our aircraft only. ----------
 pos_kp 0.5                # m/s^2 of acceleration asked per m of error  (1 m -> about 3 deg of tilt)

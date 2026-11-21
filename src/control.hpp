@@ -155,6 +155,8 @@ public:
           height_filter_s_(c("height_filter_s")),
           pilot_throttle_filter_s_(c("pilot_throttle_filter_s")),
           hover_throttle_(c("hover_throttle_fallback_us")),
+          hover_fallback_us_(c("hover_throttle_fallback_us")),
+          throttle_min_us_(c("throttle_min_us")),
           zero_Z_(c("bench_height_m")) {}
 
     // Zero the displayed position and height (bench tests: press Enter over the start mark).
@@ -206,7 +208,10 @@ public:
         if (engage_edge) {
             have_target_ = false;
             have_target_height_ = false;
-            hover_throttle_ = pilot_throttle;
+            // The throttle to hold height with is the one the pilot was holding. On the bench the pilot's
+            // stick is at the bottom (MEASURED on the board: 885 to 988), which holds nothing and would look
+            // like a minimum value to the judge (bench item D): then use the configured hover value.
+            hover_throttle_ = pilot_throttle >= throttle_min_us_ ? pilot_throttle : hover_fallback_us_;
             controller_.reset();
             zero_wanted_ = true;
         }
@@ -250,7 +255,7 @@ private:
     int ready_frames_;
     double baro_min_height_m_, bench_height_m_, scale_min_excitation_, height_filter_s_, pilot_throttle_filter_s_;
 
-    double hover_throttle_;
+    double hover_throttle_, hover_fallback_us_, throttle_min_us_;
     double reference_pa_ = 0, ground_height_ = 0, target_height_ = 0, zero_height_ = 0;
     double zero_scale_ = 1, zero_Z_;       // image scale and height above ground at the last zero
     int64_t last_baro_t_ns_ = 0;

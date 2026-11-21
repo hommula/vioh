@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <opencv2/calib3d.hpp>
+#include <opencv2/features2d.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/video/tracking.hpp>
 
@@ -84,6 +85,10 @@ public:
     double Z0 = 0;            // origin height from the accelerometer fit, m. Only meaningful if excitation is high.
     double excitation = 0;    // how much visual velocity change the fit has seen, 1/s^2 summed
     int keyframes = 0;
+    int relocks = 0;             // times the position was corrected against the home picture
+    double last_relock_U = 0;    // size of the last correction, in units of origin height
+    int home_matches = 0, home_agreeing = 0;   // last comparison with the home picture: matched corners, and how many agree
+    double home_offset_U = 0;    // and how far that comparison is from the tracker, in units of origin height
 
     explicit Estimator(const Config& c)
         : tilt_to_px_(c("tilt_to_px_xx"), c("tilt_to_px_xy"), c("tilt_to_px_yx"), c("tilt_to_px_yy")),
@@ -169,6 +174,7 @@ public:
         if (key_image_.empty()) {
             newKeyframe(gray, t);
             origin_level_ = levelled(at(t).R);
+            makeHome(gray, t, Matx33d::eye());
             return;
         }
 
@@ -240,6 +246,18 @@ public:
         updateRateAndScale(t, U_new);
         U = U_new;
 
+        // Recovery (bonus "onboard recovery", and loop closure for bench step 3): a few times a second,
+        // compare this frame directly with the home picture. If the two match, the position follows
+        // from that match alone, so whatever was missed while the lens was covered, and the drift of
+        // the keyframe chain, are gone.
+        if (home_requested_) {
+            makeHome(gray, t, total);
+            home_requested_ = false;
+        } else if (++frames_since_home_check_ >= kHomeCheckEveryFrames) {
+            frames_since_home_check_ = 0;
+            if (relock(gray, t)) return;
+        }
+
         // Points that failed or disagreed: put them where the fit says they are, for the next frame.
         std::vector<cv::Point2f> predicted_level;
         for (const cv::Point2f& p : key_level_) {
@@ -263,6 +281,9 @@ public:
 
     // Make the next registered frame the keyframe (call at engage, so the hold cannot drift).
     void requestKeyframe() { rekey_requested_ = true; }
+
+    // Make the next registered frame the home picture (call at a zero: the start mark of a bench test).
+    void requestHome() { home_requested_ = true; }
 
     // Turns a vector in origin level axes into the current level axes (they differ by the yaw since origin).
     Matx22d originToCurrent() const { return px_to_pos_ * L_hat * px_to_pos_.inv(); }
@@ -333,6 +354,77 @@ private:
         }
         cv::fisheye::distortPoints(pinhole, raw, lens_K_, lens_D_);
         return raw;
+    }
+
+    // Corners with descriptors (ORB), inside the same circle the tracker uses. Unlike the tracker they
+    // can be matched between two pictures taken far apart in time and place.
+    void describe(const cv::Mat& gray, int64_t t, std::vector<cv::Point2f>& level, cv::Mat& descriptors) {
+        // MEASURED on the board: on the whole 960 x 540 picture this step halved the frame rate (55 to 32
+        // per second). So, as for the keyframe corners: the square around the circle only, at half size.
+        const cv::Point centre(gray.cols / 2, gray.rows / 2);
+        const int radius = int(roi_radius_px_);
+        const cv::Rect box = cv::Rect(centre.x - radius, centre.y - radius, 2 * radius, 2 * radius) &
+                             cv::Rect(0, 0, gray.cols, gray.rows);
+        cv::Mat small;
+        cv::resize(gray(box), small, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+        std::vector<cv::KeyPoint> corners;
+        orb_->detectAndCompute(small, cv::noArray(), corners, descriptors);
+        std::vector<cv::Point2f> raw;
+        for (const cv::KeyPoint& corner : corners)
+            raw.push_back(cv::Point2f(box.x + 2 * corner.pt.x + 0.5f, box.y + 2 * corner.pt.y + 0.5f));
+        level = levelPoints(raw, t, gray.rows);
+    }
+
+    void makeHome(const cv::Mat& gray, int64_t t, const Matx33d& origin_to_here) {
+        describe(gray, t, home_level_, home_descriptors_);
+        origin_to_home_ = origin_to_here;
+    }
+
+    // Returns true if the position was corrected (the tracker then starts again from this frame).
+    bool relock(const cv::Mat& gray, int64_t t) {
+        if (home_descriptors_.rows < kHomeMinMatches) return false;
+        std::vector<cv::Point2f> level;
+        cv::Mat descriptors;
+        describe(gray, t, level, descriptors);
+        if (descriptors.rows < kHomeMinMatches) return false;
+        std::vector<cv::DMatch> matches;
+        cv::BFMatcher(cv::NORM_HAMMING, true).match(home_descriptors_, descriptors, matches);   // both ways agree
+        home_matches = int(matches.size());
+        home_agreeing = 0;
+        if (int(matches.size()) < kHomeMinMatches) return false;
+        std::vector<cv::Point2f> from, to;
+        for (const cv::DMatch& m : matches) {
+            from.push_back(home_level_[m.queryIdx]);
+            to.push_back(level[m.trainIdx]);
+        }
+        std::vector<uchar> agrees;
+        const cv::Mat fit = cv::estimateAffinePartial2D(from, to, agrees, cv::RANSAC, 3.0);
+        if (fit.empty()) return false;
+        // A carpet repeats itself, so a wrong match is possible: ask for many agreeing points and a
+        // large share of all matches, and a zoom that a carried aircraft could have.
+        const int agreeing = cv::countNonZero(agrees);
+        home_agreeing = agreeing;
+        const double zoom = std::hypot(fit.at<double>(0, 0), fit.at<double>(1, 0));
+        if (agreeing < kHomeMinMatches || agreeing < 0.5 * matches.size() || zoom < 0.5 || zoom > 2.0) return false;
+        const Matx33d home_to_here(fit.at<double>(0, 0), fit.at<double>(0, 1), fit.at<double>(0, 2),
+                                   fit.at<double>(1, 0), fit.at<double>(1, 1), fit.at<double>(1, 2), 0, 0, 1);
+        const Matx33d corrected = home_to_here * origin_to_home_;
+        const Matx22d L(corrected(0, 0), corrected(0, 1), corrected(1, 0), corrected(1, 1));
+        const Vec2d U_corrected = px_to_pos_ * (-(L.inv() * Vec2d(corrected(0, 2), corrected(1, 2))));
+        const double change = cv::norm(U_corrected - U);
+        home_offset_U = change;
+        if (change < kHomeMinChangeU) return false;   // the tracker already agrees: leave it alone
+        origin_to_key_ = corrected;
+        last_total_ = corrected;
+        scale = std::sqrt(cv::determinant(L));
+        L_hat = L * (1.0 / scale);
+        U = U_corrected;
+        track_.clear();          // the jump is not a movement: keep it out of the velocity and scale fit
+        U_rate = Vec2d(0, 0);
+        relocks++;
+        last_relock_U = change;
+        newKeyframe(gray, t);
+        return true;
     }
 
     void newKeyframe(const cv::Mat& gray, int64_t t) {
@@ -424,6 +516,16 @@ private:
     Matx33d last_total_ = Matx33d::eye();      // origin -> last registered frame
     Matx33d origin_level_ = Matx33d::eye();
     bool rekey_requested_ = false;
+    // Recovery against the home picture.
+    static constexpr int kHomeCheckEveryFrames = 15;      // 4 times a second at 60 frames per second
+    static constexpr int kHomeMinMatches = 30;
+    static constexpr double kHomeMinChangeU = 0.03;       // 3 cm at 1 m: smaller differences are left to the tracker
+    cv::Ptr<cv::ORB> orb_ = cv::ORB::create(400, 1.2f, 4);   // 400 corners, 4 sizes of the half-size cut-out
+    std::vector<cv::Point2f> home_level_;
+    cv::Mat home_descriptors_;
+    Matx33d origin_to_home_ = Matx33d::eye();
+    bool home_requested_ = false;
+    int frames_since_home_check_ = 0;
     int key_inliers_ = 0;   // points that agreed on the first frame after this keyframe, 0 = not known yet
 
     std::deque<TrackSample> track_;

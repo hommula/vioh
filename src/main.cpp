@@ -1,6 +1,7 @@
 // vioh: GNSS-free position hold for the Orqa M2-AI, running on the APB.
 //
 //   vioh config.txt log_dir                         fly: estimate, control, talk to the flight controller
+//   vioh config.txt log_dir rehearse                the same, but act as if the engage switch were on (no radio needed)
 //   vioh config.txt record out.vlog seconds nth     save IMU + every nth camera frame (for `calib` and `replay`)
 //
 // Inputs: nadir camera, APB IMU, APB barometer, and the RC channels from the flight controller (MSP_RC).
@@ -49,6 +50,7 @@ const int kPreviewEveryNthFrame = 12;   // 5 pictures per second at 60 frames pe
 // The numbers for tools/live_view.py: one line of text starting with '#', same folder.
 // The dashboard asks for a zero of the displayed position by creating the second file.
 const char* const kZeroRequestPath = "/dev/shm/nadirhold_zero";
+const char* const kRehearseOffPath = "/dev/shm/nadirhold_switch_off";   // rehearsal mode only
 const char* const kStatusPath = "/dev/shm/nadirhold_status.txt";
 
 static void writeStatus(const char* text) {
@@ -91,7 +93,9 @@ struct Shared {
     int64_t frames_replaced = 0;             // frames that arrived while the estimator was still busy
     double scale = 1, Z0 = 0, excitation = 0, vertical_velocity = 0, frame_ms = 0;
     cv::Matx22d origin_to_current = cv::Matx22d::eye();
-    bool keyframe_wanted = false;
+    bool keyframe_wanted = false, home_wanted = false;
+    int relocks = 0, home_matches = 0, home_agreeing = 0;
+    double home_offset_U = 0;
     // barometer thread
     int64_t baro_t_ns = 0;
     double baro_pa = 0;
@@ -180,8 +184,11 @@ static void estimatorThread(const hold::Config& config, FrameSlot& slot, Shared&
                 std::unique_lock<std::mutex> lock(shared.mutex);
                 const bool keyframe_wanted = shared.keyframe_wanted;
                 shared.keyframe_wanted = false;
+                const bool home_wanted = shared.home_wanted;
+                shared.home_wanted = false;
                 lock.unlock();
                 if (keyframe_wanted) estimator.requestKeyframe();
+                if (home_wanted) estimator.requestHome();
 
                 const int64_t start = nowNs();
                 if (got_frame) estimator.frame(frame_t, gray);
@@ -200,6 +207,10 @@ static void estimatorThread(const hold::Config& config, FrameSlot& slot, Shared&
                 shared.gyro = gyro;
                 shared.acc = acc;
                 shared.frames_replaced = frames_replaced;
+                shared.relocks = estimator.relocks;
+                shared.home_matches = estimator.home_matches;
+                shared.home_agreeing = estimator.home_agreeing;
+                shared.home_offset_U = estimator.home_offset_U;
                 if (got_frame) {
                     shared.vision_t_ns = nowNs();
                     shared.tracking = estimator.tracking;
@@ -286,8 +297,10 @@ static int record(const hold::Config& config, const char* path, double seconds, 
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3 && argc != 6) {
-        std::cerr << "usage: vioh config.txt log_dir\n       vioh config.txt record out.vlog seconds every_nth_frame\n";
+    const bool rehearse = argc == 4 && std::string(argv[3]) == "rehearse";
+    if (argc != 3 && argc != 6 && !rehearse) {
+        std::cerr << "usage: vioh config.txt log_dir\n       vioh config.txt log_dir rehearse\n"
+                     "       vioh config.txt record out.vlog seconds every_nth_frame\n";
         return 2;
     }
     const hold::Config config(argv[1]);
@@ -312,6 +325,7 @@ int main(int argc, char** argv) {
     msp::Parser parser;
     hold::Inputs in;
     const int64_t program_start_ns = nowNs();
+    int rehearse_off_ticks = 0;
     const double switch_on_us = config("switch_on_us");
     double first_ready_up_s = -1;   // seconds after power-on (the monotonic clock starts at boot) of the first READY
     const double dt = 1.0 / kLoopHz;
@@ -331,12 +345,24 @@ int main(int argc, char** argv) {
             in.rc_t_ns = in.now_ns;
         }
 
+        // Rehearsal without a radio (bench item C): act as if the engage switch were on, so the commands
+        // can be seen. The flight controller ignores them, because its own switch is off.
+        // Never used by the autostart unit: started by hand only.
+        // A zero request in rehearsal also flips the pretend switch off for a moment and on again, so
+        // the hold point becomes "here", as it does when the pilot engages.
+        // The pretend switch is on unless the file kRehearseOffPath exists (touch it = switch off).
+        if (rehearse && in.rc_t_ns != 0)
+            in.rc_engage = rehearse_off_ticks > 0 || access(kRehearseOffPath, F_OK) == 0 ? 1000 : 2000;
+        if (rehearse_off_ticks > 0) rehearse_off_ticks--;
+
         // Sensor snapshot.
         int inliers;
         double frame_ms, frames_per_s, imu_per_s;
         Vec2d tilt_rad;
         cv::Vec3d gyro, acc;
         int64_t frames_replaced;
+        int relocks, home_matches, home_agreeing;
+        double home_offset_U;
         {
             std::lock_guard<std::mutex> lock(shared.mutex);
             in.vision_t_ns = shared.vision_t_ns;
@@ -359,6 +385,10 @@ int main(int argc, char** argv) {
             gyro = shared.gyro;
             acc = shared.acc;
             frames_replaced = shared.frames_replaced;
+            relocks = shared.relocks;
+            home_matches = shared.home_matches;
+            home_agreeing = shared.home_agreeing;
+            home_offset_U = shared.home_offset_U;
         }
 
         // Enter on the keyboard: zero the displayed position (bench tests).
@@ -369,6 +399,9 @@ int main(int argc, char** argv) {
         if (access(kZeroRequestPath, F_OK) == 0) {   // the same, asked for by the dashboard
             unlink(kZeroRequestPath);
             pilot.zero();
+            rehearse_off_ticks = 3;
+            std::lock_guard<std::mutex> lock(shared.mutex);
+            shared.home_wanted = true;   // the start mark of a bench test: recover against this view
         }
 
         const hold::Sticks sticks = pilot.step(in, dt);
@@ -407,12 +440,12 @@ int main(int argc, char** argv) {
             const double turn_deg = std::atan2(in.origin_to_current(1, 0), in.origin_to_current(0, 0)) * degrees;
             char status[800];
             std::snprintf(status, sizeof status,
-                          "up=%.2f run=%.1f first_ready=%.1f ready=%d engaged=%d armed=%d tracking=%d points=%d "
+                          "up=%.2f run=%.1f first_ready=%.1f rehearse=%d ready=%d engaged=%d armed=%d tracking=%d points=%d "
                           "x=%.3f y=%.3f z=%.3f zcam=%.3f Z=%.2f zsrc=%s tiltx=%.2f tilty=%.2f turn=%.2f "
                           "roll=%u pitch=%u thr=%u yaw=%u rcthr=%u rcarm=%u rceng=%u "
                           "fps=%.1f ms=%.1f replaced=%lld imu=%.0f gx=%.3f gy=%.3f gz=%.3f ax=%.2f ay=%.2f az=%.2f "
-                          "fc=%d baro=%d cam=%d pa=%.0f",
-                          in.now_ns * 1e-9, (in.now_ns - program_start_ns) * 1e-9, first_ready_up_s, pilot.ready,
+                          "fc=%d baro=%d cam=%d pa=%.0f relocks=%d home_matches=%d home_agree=%d home_off=%.3f",
+                          in.now_ns * 1e-9, (in.now_ns - program_start_ns) * 1e-9, first_ready_up_s, rehearse, pilot.ready,
                           pilot.engaged, pilot.fc_alive && in.rc_arm >= switch_on_us, in.tracking, inliers,
                           pilot.shown[0], pilot.shown[1], pilot.height_shown, pilot.camera_height_shown, pilot.Z,
                           pilot.height_source, tilt_rad[0] * degrees, tilt_rad[1] * degrees, turn_deg,
@@ -420,7 +453,7 @@ int main(int argc, char** argv) {
                           unsigned(in.rc_throttle), unsigned(in.rc_arm), unsigned(in.rc_engage),
                           frames_per_s, frame_ms, static_cast<long long>(frames_replaced), imu_per_s,
                           gyro[0], gyro[1], gyro[2], acc[0], acc[1], acc[2],
-                          pilot.fc_alive, pilot.baro_alive, pilot.camera_alive, in.baro_pa);
+                          pilot.fc_alive, pilot.baro_alive, pilot.camera_alive, in.baro_pa, relocks, home_matches, home_agreeing, home_offset_U);
             writeStatus(status);
         }
 

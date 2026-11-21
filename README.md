@@ -145,3 +145,25 @@ Ran over SSH, no battery, props off. Snapshots before and after are in `data/boa
 | Barometer: the rate set by `run.sh` falls back to 1 per second as soon as a value is read. Each read then waits about 1 s. | OPEN: 1 value per second is too slow for the height loop. |
 | The board already has a `vioh.service` from another logger. | Our folder and unit are named `nadirhold`. |
 | `deploy.sh remove` plus writing the IMU settings back left two differences until reboot: `/dev/video2` default format and the serial port speed (115200, was 9600). | Reboot before handing on. |
+
+## Judged bench session: what to show, item by item
+
+State on 21 Nov evening: the program is on the aircraft in `/data/nadirhold` with autostart ON
+(`nadirhold.service`). On the laptop, from the repo folder: `python tools/live_view.py`. The dashboard
+connects again by itself after a power cut.
+
+| Item | What to do | What the judge reads on the dashboard | Measured on our aircraft |
+|---|---|---|---|
+| A | Nothing | "camera LIVE", "IMU LIVE", frames/s, IMU samples/s, gyro and accel numbers | 52 to 58 frames/s, 1000 samples/s |
+| B1 | Hold level 1 m over the start mark, press `z`, carry to the mark | "horizontal distance from zero" | 1.14 m shown for a taped 1.00 m (lens 310; now 335, not re-run) |
+| B2 | Press `z` over the start mark, walk the loop, stop over the mark | distance from zero, and the path plot with its 0.3 m circle | NOT RUN |
+| B3 | Press `z` at the low mark, raise to the high mark | "height change (camera)" and the height graph with 0.35 / 0.65 lines | NOT RUN |
+| C | Engage on, move 0.5 m each way | roll / pitch numbers and graph | BLOCKED until `python tools/find_axes.py` has been run once (2 minutes, it asks for a forward and a right move and writes the config). Until then roll and pitch stay 1500 |
+| D | Engage switch on and off | ENGAGED / pilot box, the four stick numbers | Measured on the aircraft in rehearsal mode (pretend switch, no radio), log `data/board/stepD_log.txt`: off = 1500/1500/1500 and the pilot's throttle; on and ready = roll/pitch move, throttle 1387 to 1398; on and not ready = 1500/1500/1500, throttle 1395 to 1411. NOT yet seen with the real switch |
+| E1 | Cover the lens 3 s | READY turns to NOT READY, "READY state changed N s ago", sticks 1500 | NOT READY in under 0.1 s; sticks 1500 throughout |
+| E2 | Unplug and replug the aircraft | "first READY N s after power-on" | 15.9 s and 15.3 s (limit 60 s) |
+
+Rules for the bench: the position and height numbers assume the aircraft is about 1 m above the floor
+(`bench_height_m`). On the floor or the table they mean nothing. Always press `z` before a test.
+
+To take everything off the aircraft again: `sh deploy/deploy.sh remove`, then power-cycle it.

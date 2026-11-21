@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
 
     const double imu_dt = 0.001, frame_dt = 1.0 / 30, duration = 40, h = 1e-4;
     const double cover_from = 30, cover_to = 33;   // lens covered: black frames
-    double next_frame = 0.5, worst_error = 0, worst_height_error = 0;
+    double next_frame = 0.5, worst_error = 0, worst_height_error = 0, worst_after_cover = 0;
     int untracked_outside_cover = 0, tracked_inside_cover = 0, frames_after_first = 0;
     bool have_origin = false;
     Vec3d origin_position;
@@ -137,7 +137,10 @@ int main(int argc, char** argv) {
                      estimate[0], estimate[1], true_height, est_height, estimator.Z0);
         if (covered) {
             tracked_inside_cover += estimator.tracking;
-        } else if (t < cover_from) {   // before the cover: the estimate must follow the truth
+        } else if (t > cover_to + 2) {   // recovery: the motion made while covered must be found again
+            worst_after_cover = std::max(worst_after_cover, std::hypot(estimate[0] - truth[0], estimate[1] - truth[1]));
+        }
+        if (!covered && t < cover_from) {   // before the cover: the estimate must follow the truth
             untracked_outside_cover += !estimator.tracking;
             worst_error = std::max(worst_error, std::hypot(estimate[0] - truth[0], estimate[1] - truth[1]));
             worst_height_error = std::max(worst_height_error, std::abs(est_height - true_height));
@@ -150,7 +153,9 @@ int main(int argc, char** argv) {
     std::printf("origin height: true %.3f m, accelerometer fit %.3f m (excitation %.2f)\n", origin_height, estimator.Z0, estimator.excitation);
     std::printf("covered lens: frames still reported as tracking %d; tracking again at the end: %s\n", tracked_inside_cover,
                 estimator.tracking ? "yes" : "no");
-    const bool pass = worst_error < kMaxPositionError && worst_height_error < kMaxHeightError && untracked_outside_cover == 0 &&
+    std::printf("after the cover (from 2 s after it): worst position error %.3f m, corrections against home %d\n",
+                worst_after_cover, estimator.relocks);
+    const bool pass = worst_after_cover < 0.25 && worst_error < kMaxPositionError && worst_height_error < kMaxHeightError && untracked_outside_cover == 0 &&
                       std::abs(estimator.Z0 - origin_height) < kMaxScaleError * origin_height && tracked_inside_cover == 0 &&
                       estimator.tracking;
     std::printf(pass ? "PASS\n" : "FAIL\n");
