@@ -1,0 +1,14 @@
+[Unit]
+Description=vioh GNSS-free position hold
+After=rth-event-setup.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/data/nadirhold/run.sh
+# The flight controller keeps our last command if we stop, so come back at once and never give up.
+Restart=always
+RestartSec=0.2
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,93 @@
+# vioh configuration. Every key is required: the program stops if one is missing.
+# Copy to /data/nadirhold/config.txt on the APB and replace the values marked MEASURE.
+# Image sizes are in pixels of the half-size image (960 x 540) that the estimator works on.
+
+# --- MEASURE on our aircraft with `calib` (see README, "Calibrate") -------------------------------
+# The values below come from the one hand-held desk recording we have (20261121T160159Z). That
+# recording has a lot of sideways movement close to the desk, so they are only good enough to
+# check that the pipeline runs. Redo with a rotation-only recording of a far scene.
+# Only the rotation hidden in these four numbers is used (which way the camera is turned relative to
+# the IMU). Their size should match lens_fx: that is a cross-check of the two calibrations.
+tilt_to_px_xx 769.6       # image shift (px) per rad of body rotation: x shift from rotation about IMU x
+tilt_to_px_xy 80.9        #   x shift from rotation about IMU y
+tilt_to_px_yx -74.4       #   y shift from rotation about IMU x
+tilt_to_px_yy 571.6       #   y shift from rotation about IMU y
+cam_delay_s -0.0138       # add to the camera timestamp to get IMU time of the last image row
+rolling_shutter_readout_s 0.0009   # time from first to last image row
+
+# --- MEASURE with a checkerboard (lens calibration, OpenCV fisheye model) ---------------------------
+# The lens is a fisheye: straight floor lines are visibly bent in the 20261121 recording. The values
+# below are a weak estimate from straightening those lines (equal-angle fisheye, focal length about
+# 500 px, centre assumed in the middle). Replace all eight with a cv::fisheye::calibrate result for the
+# 960 x 540 image.
+# MEASURED 21 Nov on our aircraft: focal length from one taped 1.00 m move at about 1 m height (0.62 m shown
+# with 500), shape and centre from the fabric frame fitted at that focal length (tools note in README).
+# Second move with 310: 1.14 m shown for 1.00 m. 335 is between the two results and NOT yet run on the aircraft.
+lens_fx 335
+lens_fy 335
+lens_cx 455
+lens_cy 248
+lens_k1 0.07
+lens_k2 0
+lens_k3 0
+lens_k4 0
+
+# --- Estimator settings (choices, not hardware facts) --------------------------------------------
+roi_radius_px 250         # only use the image centre: keeps the airframe out of view. Widen once the lens is calibrated.
+max_corners 200
+min_inliers 25            # fewer agreeing points than this = not tracking
+min_inlier_ratio 0.5      # ... and at least this share of the keyframe points must agree
+ransac_px 2.0
+rekey_shift_px 150        # take a new keyframe when the image moved this far from the keyframe ...
+rekey_log_scale 0.2       # ... or zoomed by more than exp(0.2) ...
+rekey_rotation_rad 0.35   # ... or rotated this much
+rekey_inlier_ratio 0.75   # ... or fewer than this share of the keyframe points still agree
+gravity_gain_per_s 0.08   # pull of the accelerometer on the tilt. Tested 0.05 to 0.3 with the noise MEASURED on the board: 0.08 is the highest that keeps the simulation within its limits
+                          # acceleration tilts the measured "up" and that leaks into the position (see simtest).
+attitude_settle_s 6       # no image is used before the attitude has had this long to settle
+still_gyro_rad_s 0.05     # below this rotation rate the gyro bias is learned quickly
+still_gyro_sd_rad_s 0.018 # gyro spread (3 axes, half a second) below this = at rest. MEASURED on the board: 0.010 at rest, 0.031 hand-held
+rate_filter_s 0.1         # low-pass on velocity
+scale_lag_s 0.3           # accelerometer scale fit: compare velocity changes over this time
+scale_memory_s 20         # ... and forget old motion after about this long
+ready_frames 60           # consecutive tracked frames before the estimate counts as ready
+
+# --- Height and scale ------------------------------------------------------------------------------
+imu_rate_hz 1000          # IIO sampling_frequency for gyro and accel (the 20261121 recording used 1000)
+height_filter_s 1.0       # barometer/accelerometer blend time
+baro_rate_hz 32           # chip measurements per second; the program reads every second one
+baro_oversampling 8       # MEASURED on the board 21 Nov: values within 1 Pa (8 cm). 16 and more fail (driver bug)
+baro_min_height_m 3.0     # above this (and armed on the ground) the barometer gives the height for scale
+scale_min_excitation 1e12 # OFF. MEASURED on the board 21 Nov: the accelerometer height fit made the resting position jump 6.6 times. Until it is proven, the bench uses bench_height_m
+bench_height_m 1.0        # used when neither source is available. Stage 2 section 05: "about 1 m above the floor".
+
+# --- Flight controller (Betaflight). From dumps/fc-backup-2026-11-21/dump_all.txt: check with `get` on the day.
+arm_channel 5             # aux 0 0 0 1800 2100  -> ARM on AUX1 = channel 5
+engage_channel 10         # Stage 2 section 03: CH10 high
+switch_on_us 1800         # a switch is on at or above this (the judge's tool uses 1800 for CH10)
+bf_angle_limit_deg 30     # profile 0: angle_limit
+bf_rc_rate_deg_s 70       # rateprofile 0: roll_rc_rate 7, rates_type ACTUAL -> 70 deg/s centre sensitivity
+bf_max_rate_deg_s 530     # rateprofile 0: roll_srate 53
+bf_deadband_us 10         # deadband. (roll_expo and pitch_expo must be 0: the stick formula assumes it.)
+hover_throttle_fallback_us 1400   # measured in blackbox log 3 (hover near the ground, docs/blackbox-findings.md).
+                          # Used only if the pilot's throttle was never seen. The FC's ap_hover_throttle says 1550.
+throttle_min_us 1100      # FC setting ap_throttle_min
+throttle_max_us 2000      # FC setting ap_throttle_max
+pilot_throttle_filter_s 0.5
+
+# --- MEASURE on the bench, props off (README, "Find the axis signs") --------------------------------
+# Which IMU axis points forward and which points right. One of each pair is +1 or -1, the other 0.
+# All zero = roll and pitch stay at 1500, which is the safe state until this is measured.
+forward_from_x 0
+forward_from_y 0
+right_from_x 0
+right_from_y 0
+
+# --- Controller gains: STARTING VALUES FROM PHYSICS, NOT TUNED. Tune on our aircraft only. ----------
+pos_kp 0.5                # m/s^2 of acceleration asked per m of error  (1 m -> about 3 deg of tilt)
+pos_kd 1.0                # m/s^2 per m/s                               (damping ratio about 0.7 with kp 0.5)
+pos_ki 0.05               # m/s^2 per m*s, for steady wind
+max_tilt_deg 10
+height_kp_us_per_m 30
+height_kd_us_per_m_s 40
+height_ki_us_per_m_s 5

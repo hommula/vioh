@@ -1,0 +1,5 @@
+build*/
+*.vlog
+*.csv
+*.png
+__pycache__/
